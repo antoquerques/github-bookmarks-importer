@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GitHub Bookmarks Importer</title>
+  <style>
+    body {
+      max-width: 700px;
+      margin: 40px auto;
+      padding: 0 20px;
+      font: 16px system-ui, sans-serif;
+      line-height: 1.5;
+    }
+
+    input, button {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 10px;
+      margin: 6px 0 14px;
+      font: inherit;
+    }
+
+    button {
+      cursor: pointer;
+    }
+
+    #status {
+      white-space: pre-wrap;
+    }
+
+    #results {
+      margin-top: 24px;
+    }
+
+    #files {
+      padding-left: 20px;
+      margin-bottom: 20px;
+    }
+  </style>
+</head>
+<body>
+  <h1>GitHub Bookmarks Importer</h1>
+  <p>
+    Convert the links in the Markdown files of a GitHub repository
+    into an HTML file you can import into your browser's bookmarks.
+  </p>
+
+  <label for="repository">GitHub repository URL</label>
+  <input
+    id="repository"
+    type="url"
+    placeholder="https://github.com/owner/repository"
+  >
+
+  <button id="import-button">Read repository</button>
+  <p id="status" aria-live="polite"></p>
+
+  <section id="results" hidden>
+    <h2>Result</h2>
+    <p id="summary"></p>
+    <ul id="files"></ul>
+    <button id="download-button">Download bookmarks.html</button>
+  </section>
+
+  <script>
+    const repositoryInput = document.getElementById("repository");
+    const importButton = document.getElementById("import-button");
+    const statusElement = document.getElementById("status");
+    const results = document.getElementById("results");
+    const summary = document.getElementById("summary");
+    const filesList = document.getElementById("files");
+    const downloadButton = document.getElementById("download-button");
+
+    const BATCH_SIZE = 10;
+    const IMAGE_PATTERN = /\.(png|jpe?g|gif|svg|webp|ico|bmp)(\?.*)?$/i;
+
+    let bookmarkFile = "";
+    let repositoryName = "";
+
+    function getRepositoryDetails(url) {
+      const parsedUrl = new URL(url);
+
+      if (parsedUrl.hostname !== "github.com") {
+        throw new Error("Enter a valid GitHub URL: https://github.com/owner/repository");
+      }
+
+      const parts = parsedUrl.pathname.split("/").filter(Boolean);
+
+      if (parts.length < 2) {
+        throw new Error("The URL must follow this format: https://github.com/owner/repository");
+      }
+
+      return {
+        owner: parts[0],
+        repository: parts[1].replace(/\.git$/, "")
+      };
+    }
+
+    async function getGitHubData(url) {
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error(`GitHub error (${response.status}). Check the URL.`);
+      }
+
+      return response.json();
+    }
+
+    // raw.githubusercontent doesn't count towards the API rate limit
+    async function getRawFile(owner, repository, branch, path) {
+      const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+      const url =
+        `https://raw.githubusercontent.com/${owner}/${repository}/` +
+        `${encodeURIComponent(branch)}/${encodedPath}`;
+
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error(`Could not read ${path} (${response.status}).`);
+      }
+
+      return response.text();
+    }
+
+    function cleanUrl(url) {
+      url = url.replace(/[.,;:!?'"*_]+$/, "");
+
+      while (url.endsWith(")")) {
+        const open = (url.match(/\(/g) || []).length;
+        const close = (url.match(/\)/g) || []).length;
+
+        if (close <= open) {
+          break;
+        }
+
+        url = url.slice(0, -1);
+      }
+
+      return url;
+    }
+
+    function isValidUrl(url) {
+      try {
+        const parsed = new URL(url);
+
+        if (!["http:", "https:"].includes(parsed.protocol)) {
+          return false;
+        }
+
+        if (parsed.hostname.endsWith("shields.io")) {
+          return false;
+        }
+
+        return !IMAGE_PATTERN.test(parsed.pathname + parsed.search);
+      } catch {
+        return false;
+      }
+    }
+
+    function extractLinks(line) {
+      const links = [];
+
+      // remove inline code and images first, so badges don't end up as links
+      line = line
+        .replace(/`[^`]*`/g, " ")
+        .replace(/!\[[^\]]*\]\((?:[^\s()]|\([^\s()]*\))*[^)]*\)/g, "");
+
+      // [title](url) with one level of parentheses allowed in the url
+      const markdownLink =
+        /\[([^\]]*)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)(?:\s+"[^"]*")?\)/g;
+
+      line = line.replace(markdownLink, (match, title, url) => {
+        links.push({ title: title.trim(), url });
+        return " ";
+      });
+
+      for (const match of line.matchAll(/https?:\/\/[^\s<>\]]+/g)) {
+        links.push({ title: "", url: cleanUrl(match[0]) });
+      }
+
+      return links
+        .filter(link => isValidUrl(link.url))
+        .map(link => ({
+          title: link.title || new URL(link.url).hostname,
+          url: link.url
+        }));
+    }
+
+    function cleanHeading(text) {
+      return text
+        .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+        .replace(/[*_`]/g, "")
+        .trim();
+    }
+
+    function createFolder(name) {
+      return { name, links: [], children: new Map() };
+    }
+
+    function getChild(parent, name) {
+      if (!parent.children.has(name)) {
+        parent.children.set(name, createFolder(name));
+      }
+
+      return parent.children.get(name);
+    }
+
+    // headings (#, ##, ...) become subfolders of the file's folder
+    function parseMarkdown(markdown, fileFolder, foundUrls) {
+      const sections = [];
+      let inCode = false;
+      let count = 0;
+
+      for (const line of markdown.split(/\r?\n/)) {
+        if (/^\s*(```|~~~)/.test(line)) {
+          inCode = !inCode;
+          continue;
+        }
+
+        if (inCode) {
+          continue;
+        }
+
+        const heading = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+
+        if (heading) {
+          const level = heading[1].length;
+          const name = cleanHeading(heading[2]);
+
+          while (sections.length && sections[sections.length - 1].level >= level) {
+            sections.pop();
+          }
+
+          if (name) {
+            const parent = sections.length
+              ? sections[sections.length - 1].folder
+              : fileFolder;
+
+            sections.push({ level, folder: getChild(parent, name) });
+          }
+
+          continue;
+        }
+
+        const current = sections.length
+          ? sections[sections.length - 1].folder
+          : fileFolder;
+
+        for (const link of extractLinks(line)) {
+          if (!foundUrls.has(link.url)) {
+            foundUrls.add(link.url);
+            current.links.push(link);
+            count++;
+          }
+        }
+      }
+
+      return count;
+    }
+
+    function countLinks(folder) {
+      let total = folder.links.length;
+
+      for (const child of folder.children.values()) {
+        total += countLinks(child);
+      }
+
+      return total;
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, character => {
+        const entities = {
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;"
+        };
+
+        return entities[character];
+      });
+    }
+
+    function writeFolder(folder, date, indent) {
+      if (countLinks(folder) === 0) {
+        return "";
+      }
+
+      const space = "  ".repeat(indent);
+      let html = `${space}<DT><H3 ADD_DATE="${date}">${escapeHtml(folder.name)}</H3>\n`;
+      html += `${space}<DL><p>\n`;
+
+      for (const link of folder.links) {
+        html += `${space}  <DT><A HREF="${escapeHtml(link.url)}" ADD_DATE="${date}">` +
+          `${escapeHtml(link.title)}</A>\n`;
+      }
+
+      for (const child of folder.children.values()) {
+        html += writeFolder(child, date, indent + 1);
+      }
+
+      return html + `${space}</DL><p>\n`;
+    }
+
+    function createBookmarkFile(root) {
+      const date = Math.floor(Date.now() / 1000);
+
+      return `<!DOCTYPE NETSCAPE-Bookmark-file-1>
+<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">
+<TITLE>Bookmarks</TITLE>
+<H1>Bookmarks</H1>
+<DL><p>
+${writeFolder(root, date, 1)}</DL><p>
+`;
+    }
+
+    async function importRepository() {
+      results.hidden = true;
+      importButton.disabled = true;
+      statusElement.textContent = "Connecting to GitHub...";
+
+      try {
+        const { owner, repository } =
+          getRepositoryDetails(repositoryInput.value.trim());
+
+        const repositoryUrl =
+          `https://api.github.com/repos/${owner}/${repository}`;
+
+        const repositoryData = await getGitHubData(repositoryUrl);
+        const branch = repositoryData.default_branch;
+
+        statusElement.textContent = `Reading branch "${branch}"...`;
+
+        const tree = await getGitHubData(
+          `${repositoryUrl}/git/trees/${encodeURIComponent(branch)}?recursive=1`
+        );
+
+        if (tree.truncated) {
+          throw new Error("The repository is too large to read in one go.");
+        }
+
+        const markdownFiles = tree.tree.filter(file =>
+          file.type === "blob" && file.path.toLowerCase().endsWith(".md")
+        );
+
+        if (markdownFiles.length === 0) {
+          throw new Error("No Markdown (.md) files found.");
+        }
+
+        const contents = [];
+        let failed = 0;
+
+        // download in batches
+        for (let i = 0; i < markdownFiles.length; i += BATCH_SIZE) {
+          const batch = markdownFiles.slice(i, i + BATCH_SIZE);
+
+          statusElement.textContent =
+            `Reading files ${i + 1}-${i + batch.length} of ${markdownFiles.length}...`;
+
+          const texts = await Promise.all(batch.map(file =>
+            getRawFile(owner, repository, branch, file.path).catch(() => null)
+          ));
+
+          texts.forEach((text, index) => {
+            if (text === null) {
+              failed++;
+            } else {
+              contents.push({ path: batch[index].path, text });
+            }
+          });
+        }
+
+        const root = createFolder(repository);
+        const foundUrls = new Set();
+        const fileStats = [];
+
+        for (const { path, text } of contents) {
+          let folder = root;
+
+          for (const part of path.split("/")) {
+            folder = getChild(folder, part.replace(/\.md$/i, ""));
+          }
+
+          const count = parseMarkdown(text, folder, foundUrls);
+
+          if (count > 0) {
+            fileStats.push({ path, count });
+          }
+        }
+
+        const totalLinks = countLinks(root);
+
+        if (totalLinks === 0) {
+          throw new Error("No links found in the Markdown files.");
+        }
+
+        repositoryName = repository;
+        bookmarkFile = createBookmarkFile(root);
+
+        summary.textContent =
+          `${totalLinks} links found in ${fileStats.length} files.` +
+          (failed ? ` ${failed} files could not be read.` : "");
+
+        filesList.replaceChildren(...fileStats.map(({ path, count }) => {
+          const item = document.createElement("li");
+          item.textContent = `${path}: ${count} links`;
+          return item;
+        }));
+
+        results.hidden = false;
+        statusElement.textContent = "Done.";
+      } catch (error) {
+        statusElement.textContent = `Error: ${error.message}`;
+      } finally {
+        importButton.disabled = false;
+      }
+    }
+
+    function downloadBookmarks() {
+      const file = new Blob([bookmarkFile], { type: "text/html;charset=utf-8" });
+      const url = URL.createObjectURL(file);
+      const link = document.createElement("a");
+
+      link.href = url;
+      link.download = `${repositoryName}-bookmarks.html`;
+      link.click();
+
+      URL.revokeObjectURL(url);
+    }
+
+    importButton.addEventListener("click", importRepository);
+    downloadButton.addEventListener("click", downloadBookmarks);
+  </script>
+</body>
+</html>
